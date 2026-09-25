@@ -1,0 +1,571 @@
+name: Build HOLY-SA from Dropbox
+
+on:
+  workflow_dispatch:
+    inputs:
+      dropbox_url:
+        description: "Прямая ссылка на ZIP исходников (Dropbox, dl=1)"
+        required: true
+        default: "https://www.dropbox.com/scl/fi/r3885ofbo8gu8x4t35r11/holy-sa-main.zip?rlkey=h8fsaxx7roxdj3vhot2bpq4ep&st=id8s34zv&dl=1"
+      ip:
+        description: "IP SA-MP сервера"
+        required: true
+        default: "188.127.241.74"
+      port:
+        description: "Порт SA-MP сервера"
+        required: true
+        default: "2142"
+      flavor:
+        description: "Product flavor"
+        required: true
+        default: "ver_release"
+        type: choice
+        options:
+          - ver_release
+          - ver_test
+      build_type:
+        description: "Build type"
+        required: true
+        default: "Release"
+        type: choice
+        options:
+          - Release
+          - Debug
+
+env:
+  ANDROID_HOME: /usr/local/lib/android/sdk
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  ANDROID_NDK_VERSION: 28.0.13004108
+
+jobs:
+  build:
+    name: Download → Patch → Build HOLY-SA
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android SDK / NDK
+        shell: bash
+        run: |
+          set -e
+
+          SDK="$ANDROID_HOME"
+          echo "ANDROID_HOME=$SDK"
+
+          SM="$(find "$SDK/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -1 || true)"
+
+          if [ -z "$SM" ]; then
+            echo "cmdline-tools not found, installing..."
+            mkdir -p "$HOME/android-cmdline/latest"
+            curl -fsSL -o /tmp/cmdtools.zip \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            rm -rf /tmp/cmdtools
+            mkdir -p /tmp/cmdtools
+            unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools
+            mv /tmp/cmdtools/cmdline-tools/* "$HOME/android-cmdline/latest/"
+            SM="$HOME/android-cmdline/latest/bin/sdkmanager"
+            chmod +x "$SM"
+          fi
+
+          echo "sdkmanager=$SM"
+
+          mkdir -p "$SDK/licenses"
+          printf '%s\n' \
+            "24333f8a63b6825ea9c5514f83c2829b004d1fee" \
+            "84831b9409646a918e30573bab4c9c91346d8abd" \
+            > "$SDK/licenses/android-sdk-license"
+
+          yes | "$SM" --sdk_root="$SDK" --licenses >/dev/null 2>&1 || true
+
+          "$SM" --sdk_root="$SDK" --install \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "platform-tools" \
+            "cmake;3.22.1" \
+            "ndk;${ANDROID_NDK_VERSION}"
+
+          NDK_DIR="$SDK/ndk/${ANDROID_NDK_VERSION}"
+
+          if [ ! -d "$NDK_DIR" ]; then
+            echo "::error::NDK ${ANDROID_NDK_VERSION} was not installed"
+            ls -la "$SDK/ndk" || true
+            exit 1
+          fi
+
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "NDK_DIR=$NDK_DIR" >> "$GITHUB_ENV"
+
+      - name: Download source from Dropbox
+        shell: bash
+        run: |
+          set -e
+
+          URL='${{ github.event.inputs.dropbox_url }}'
+
+          # Make any Dropbox link a direct-download link.
+          URL="$(printf '%s' "$URL" | sed -E 's/([?&])dl=[01]/\1dl=1/g')"
+
+          if ! printf '%s' "$URL" | grep -q '[?&]dl='; then
+            URL="${URL}&dl=1"
+          fi
+
+          echo "Downloading HOLY-SA sources from Dropbox..."
+          echo "$URL" | sed -E 's#(rlkey=)[^&]+#\1***#g'
+
+          curl -L --fail --retry 5 --retry-delay 5 \
+            --connect-timeout 30 --max-time 1800 \
+            -o source.zip "$URL"
+
+          test -s source.zip
+          ls -lh source.zip
+
+      - name: Extract HOLY-SA source
+        shell: bash
+        run: |
+          set -e
+
+          rm -rf project
+          mkdir -p project
+          unzip -q source.zip -d project
+
+          # The supplied archive is holy-sa-main/...
+          if [ -f "project/holy-sa-main/gradlew" ]; then
+            ROOT="$PWD/project/holy-sa-main"
+          else
+            ROOT="$(find project -type f -name gradlew -print -quit | xargs -r dirname)"
+          fi
+
+          if [ -z "$ROOT" ] || [ ! -f "$ROOT/gradlew" ]; then
+            echo "::error::Gradle wrapper (gradlew) not found"
+            find project -maxdepth 4 -type f | head -100
+            exit 1
+          fi
+
+          if [ ! -f "$ROOT/settings.gradle.kts" ]; then
+            echo "::error::settings.gradle.kts not found in project root: $ROOT"
+            exit 1
+          fi
+
+          if [ ! -f "$ROOT/app/build.gradle" ]; then
+            echo "::error::app/build.gradle not found in project root: $ROOT"
+            exit 1
+          fi
+
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+
+          echo "=== Project root ==="
+          echo "$ROOT"
+          echo "=== Project files ==="
+          ls -la "$ROOT"
+          echo "=== Gradle wrapper ==="
+          grep -E 'distributionUrl=' \
+            "$ROOT/gradle/wrapper/gradle-wrapper.properties" || true
+
+      - name: Verify HOLY-SA native sources
+        shell: bash
+        run: |
+          set -e
+          CPP="$PROJECT_ROOT/app/src/main/cpp"
+
+          test -f "$CPP/CMakeLists.txt"
+          test -f "$CPP/multiplayer/CMakeLists.txt"
+          test -f "$CPP/multiplayer/main.cpp"
+          test -d "$CPP/multiplayer/vendor/raknet"
+          test -d "$CPP/multiplayer/vendor/imgui"
+          test -f "$CPP/multiplayer/vendor/bass/libs/arm64-v8a/libbass.so"
+          test -f "$CPP/multiplayer/vendor/bass/libs/armeabi-v7a/libbass.so"
+
+          echo "Native source tree is valid:"
+          echo "  CMake: $CPP/CMakeLists.txt"
+          echo "  Multiplayer: $CPP/multiplayer"
+          echo "  RakNet: $CPP/multiplayer/vendor/raknet"
+          echo "  ImGui: $CPP/multiplayer/vendor/imgui"
+          echo "  BASS: both Android ABIs"
+
+      - name: Fix Linux case-sensitive include paths
+        shell: bash
+        run: |
+          set -e
+          export PROJECT_ROOT
+
+          python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          root = Path(os.environ["PROJECT_ROOT"])
+          mp = root / "app/src/main/cpp/multiplayer"
+
+          if not mp.is_dir():
+              raise SystemExit("multiplayer directory not found")
+
+          # The supplied HOLY-SA archive already contains vendor/raknet
+          # and vendor/imgui in lowercase. Do NOT rename those directories.
+          replacements = [
+              (r'(#\s*include\s*"[^"]*)RakNet/', r'\1raknet/'),
+              (r'(#\s*include\s*"[^"]*)ImGui/', r'\1imgui/'),
+              (r'(#\s*include\s*")RGBA\.h(")', r'\1rgba.h\2'),
+              (r'(#\s*include\s*")CHandlingDataMgr\.h(")', r'\1cHandlingDataMgr.h\2'),
+              (r'(#\s*include\s*")GPS\.h(")', r'\1gps.h\2'),
+          ]
+
+          source_ext = {".h", ".hpp", ".c", ".cpp", ".cc", ".cxx"}
+          fixed = 0
+
+          for p in mp.rglob("*"):
+              if p.suffix.lower() not in source_ext:
+                  continue
+              try:
+                  text = p.read_text(encoding="utf-8", errors="ignore")
+              except Exception:
+                  continue
+
+              new = text
+              for pattern, replacement in replacements:
+                  new = re.sub(pattern, replacement, new)
+
+              if new != text:
+                  p.write_text(new, encoding="utf-8")
+                  fixed += 1
+
+          print(f"Fixed include paths in {fixed} files")
+
+          # Create header-only aliases when Linux sees a filename-case mismatch.
+          # Never create aliases for .cpp files because CMake GLOB_RECURSE could
+          # compile the same translation unit twice.
+          header_index = {}
+          for p in mp.rglob("*"):
+              if p.is_file() and p.suffix.lower() in {".h", ".hpp"} and not p.is_symlink():
+                  header_index.setdefault(p.name.lower(), p)
+
+          include_re = re.compile(r'#\s*include\s*"([^"]+)"')
+          needed = set()
+
+          for p in mp.rglob("*"):
+              if p.suffix.lower() not in source_ext:
+                  continue
+              try:
+                  text = p.read_text(encoding="utf-8", errors="ignore")
+              except Exception:
+                  continue
+              for m in include_re.finditer(text):
+                  needed.add(Path(m.group(1)).name)
+
+          aliases = 0
+          for name in sorted(needed):
+              real = header_index.get(name.lower())
+              if not real or real.name == name:
+                  continue
+
+              link = real.parent / name
+              if link.exists() or link.is_symlink():
+                  continue
+
+              try:
+                  link.symlink_to(real.name)
+                  aliases += 1
+              except OSError as e:
+                  print(f"skip {link}: {e}")
+
+          print(f"Created header aliases: {aliases}")
+
+          # Final checks for this exact source tree.
+          checks = [
+              mp / "vendor/raknet/BitStream.h",
+              mp / "game/rgba.h",
+              mp / "game/cHandlingDataMgr.h",
+          ]
+
+          for p in checks:
+              print(f"{p.relative_to(mp)}: {'OK' if p.exists() else 'MISSING'}")
+          PY
+
+      - name: Patch SA-MP server IP and port
+        env:
+          NEW_IP: ${{ github.event.inputs.ip }}
+          NEW_PORT: ${{ github.event.inputs.port }}
+        shell: bash
+        run: |
+          set -e
+
+          MAIN_CPP="$PROJECT_ROOT/app/src/main/cpp/multiplayer/main.cpp"
+
+          if [ ! -f "$MAIN_CPP" ]; then
+            echo "::error::HOLY-SA main.cpp not found: $MAIN_CPP"
+            exit 1
+          fi
+
+          echo "Patching:"
+          echo "  IP   = $NEW_IP"
+          echo "  PORT = $NEW_PORT"
+
+          export MAIN_CPP
+
+          python3 <<'PY'
+          import os
+          import re
+          import sys
+
+          path = os.environ["MAIN_CPP"]
+          ip = os.environ["NEW_IP"]
+          port = os.environ["NEW_PORT"]
+
+          with open(path, "r", encoding="utf-8", errors="replace") as f:
+              src = f.read()
+
+          original = src
+
+          # Exact format used by the supplied HOLY-SA main.cpp.
+          src, n_ip = re.subn(
+              r'"(\d{1,3}(?:\.\d{1,3}){3})"_obf',
+              f'"{ip}"_obf',
+              src,
+              count=1
+          )
+
+          src, n_port = re.subn(
+              r'std::atoi\("(\d+)"_obf\)',
+              f'std::atoi("{port}"_obf)',
+              src,
+              count=1
+          )
+
+          # Fallbacks for future source changes.
+          if n_ip == 0:
+              src, n_ip = re.subn(
+                  r'CNetGame\(\s*"(\d{1,3}(?:\.\d{1,3}){3})"',
+                  f'CNetGame("{ip}"',
+                  src,
+                  count=1
+              )
+
+          if n_port == 0:
+              src, n_port = re.subn(
+                  r'std::atoi\(\s*"(\d+)"\s*\)',
+                  f'std::atoi("{port}")',
+                  src,
+                  count=1
+              )
+
+          if src == original:
+              print("Could not find the server address in main.cpp.")
+              for i, line in enumerate(original.splitlines(), 1):
+                  if "CNetGame" in line or re.search(r'\d+\.\d+\.\d+\.\d+', line):
+                      print(f"{i}: {line}")
+              sys.exit(1)
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(src)
+
+          print(f"IP replacements: {n_ip}")
+          print(f"Port replacements: {n_port}")
+          PY
+
+          echo "----- patched CNetGame -----"
+          grep -nE 'CNetGame|_obf' "$MAIN_CPP" | head -20
+
+      - name: Prepare Gradle
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_ROOT"
+
+          chmod +x ./gradlew
+          printf 'sdk.dir=%s\nndk.dir=%s\n' \
+            "$ANDROID_HOME" \
+            "$NDK_DIR" > local.properties
+
+          echo "=== local.properties ==="
+          cat local.properties
+
+          echo "=== Gradle tasks ==="
+          ./gradlew tasks --no-daemon --console=plain | grep -E 'assemble(Ver_release|Ver_test)' | head -20 || true
+
+      - name: Fix duplicate native libraries
+        shell: bash
+        run: |
+          set -e
+
+          BG="$PROJECT_ROOT/app/build.gradle"
+
+          if [ ! -f "$BG" ]; then
+            echo "::error::app/build.gradle not found"
+            exit 1
+          fi
+
+          # This project ships libbass.so for both ABIs and uses ShadowHook
+          # from Maven. Keep the original dependencies and only make JNI
+          # packaging tolerant of duplicate native libraries.
+          python3 <<'PY'
+          from pathlib import Path
+
+          bg = Path(r"${{ github.workspace }}") / "project/holy-sa-main/app/build.gradle"
+          if not bg.exists():
+              import os
+              bg = Path(os.environ["PROJECT_ROOT"]) / "app/build.gradle"
+
+          text = bg.read_text(encoding="utf-8", errors="ignore")
+
+          if "pickFirsts +=" not in text:
+              old = """    packagingOptions {
+        jniLibs {
+            excludes += ['META-INF/*']
+        }
+        resources {
+            excludes += ['META-INF/*']
+        }
+    }"""
+
+              new = """    packagingOptions {
+        jniLibs {
+            excludes += ['META-INF/*']
+            pickFirsts += ['**/libbass.so', '**/libbass_ssl.so', '**/libc++_shared.so']
+        }
+        resources {
+            excludes += ['META-INF/*']
+        }
+    }"""
+
+              if old in text:
+                  text = text.replace(old, new, 1)
+                  bg.write_text(text, encoding="utf-8")
+                  print("Added JNI pickFirst rules")
+              else:
+                  print("Existing packaging block differs; leaving it unchanged")
+          else:
+              print("JNI pickFirst rules already present")
+          PY
+
+          grep -nE 'packagingOptions|pickFirsts|libbass|libc\+\+_shared' "$BG" || true
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_ROOT"
+
+          FLAVOR="${{ github.event.inputs.flavor }}"
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+
+          FLAVOR_CAP="$(printf '%s' "$FLAVOR" | sed 's/^./\U&/')"
+          TASK="assemble${FLAVOR_CAP}${BUILD_TYPE}"
+
+          echo "Gradle task: $TASK"
+          echo "NDK: $ANDROID_NDK_HOME"
+
+          ./gradlew "$TASK" \
+            --stacktrace \
+            --no-daemon \
+            --console=plain
+
+      - name: Find and rename APK
+        id: apk
+        shell: bash
+        run: |
+          set -e
+
+          FLAVOR="${{ github.event.inputs.flavor }}"
+          BT="$(printf '%s' "${{ github.event.inputs.build_type }}" | tr '[:upper:]' '[:lower:]')"
+          IP="${{ github.event.inputs.ip }}"
+          PORT="${{ github.event.inputs.port }}"
+
+          APK="$(find "$PROJECT_ROOT/app/build/outputs/apk" \
+            -type f -name '*.apk' | head -1)"
+
+          if [ -z "$APK" ]; then
+            echo "::error::APK not found"
+            find "$PROJECT_ROOT/app/build/outputs" -type f 2>/dev/null || true
+            exit 1
+          fi
+
+          VERSION="$(grep -oP 'versionName\s+"\K[^"]+' \
+            "$PROJECT_ROOT/app/build.gradle" 2>/dev/null | head -1 || true)"
+
+          VERSION="${VERSION:-5.5}"
+          SAFE_IP="$(printf '%s' "$IP" | tr -cd '0-9.')"
+
+          NAME="HOLY-SA_v${VERSION}_${FLAVOR}_${BT}_${SAFE_IP}_${PORT}.apk"
+
+          cp "$APK" "$NAME"
+
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+          echo "=== APK ==="
+          ls -lh "$NAME"
+
+      - name: Upload APK to GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.name }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload APK to Dropbox
+        env:
+          DROPBOX_TOKEN: ${{ secrets.DROPBOX_ACCESS_TOKEN }}
+          DROPBOX_FOLDER: ${{ secrets.DROPBOX_PATH }}
+          APK_FILE: ${{ steps.apk.outputs.name }}
+        shell: bash
+        run: |
+          set -e
+
+          if [ -z "$DROPBOX_TOKEN" ]; then
+            echo "DROPBOX_ACCESS_TOKEN не задан — Dropbox upload пропущен."
+            exit 0
+          fi
+
+          FOLDER="${DROPBOX_FOLDER:-/HOLY-SA-builds}"
+          DEST="${FOLDER%/}/${APK_FILE}"
+
+          echo "Uploading APK to Dropbox: $DEST"
+
+          curl -sS --fail-with-body \
+            -X POST https://content.dropboxapi.com/2/files/upload \
+            --header "Authorization: Bearer ${DROPBOX_TOKEN}" \
+            --header "Dropbox-API-Arg: {\"path\":\"${DEST}\",\"mode\":\"overwrite\"}" \
+            --header "Content-Type: application/octet-stream" \
+            --data-binary @"${APK_FILE}"
+
+          SHARE="$(curl -sS \
+            -X POST https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings \
+            --header "Authorization: Bearer ${DROPBOX_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data "{\"path\":\"${DEST}\",\"settings\":{\"requested_visibility\":\"public\"}}" || true)"
+
+          if echo "$SHARE" | grep -q '"error"'; then
+            SHARE="$(curl -sS \
+              -X POST https://api.dropboxapi.com/2/sharing/list_shared_links \
+              --header "Authorization: Bearer ${DROPBOX_TOKEN}" \
+              --header "Content-Type: application/json" \
+              --data "{\"path\":\"${DEST}\",\"direct_only\":true}")"
+          fi
+
+          LINK="$(echo "$SHARE" | python3 -c \
+            'import sys,json; d=json.load(sys.stdin); print(d.get("url") or (d.get("links") or [{}])[0].get("url",""))' \
+            2>/dev/null || true)"
+
+          echo "Dropbox link: $LINK"
+          echo "### Dropbox APK" >> "$GITHUB_STEP_SUMMARY"
+          echo "$LINK" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build summary
+        if: always()
+        run: |
+          {
+            echo "## HOLY-SA build"
+            echo ""
+            echo "- Flavor: \`${{ github.event.inputs.flavor }}\`"
+            echo "- Build type: \`${{ github.event.inputs.build_type }}\`"
+            echo "- Server: \`${{ github.event.inputs.ip }}:${{ github.event.inputs.port }}\`"
+            echo "- NDK: \`${ANDROID_NDK_VERSION}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
